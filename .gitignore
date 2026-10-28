@@ -1,0 +1,27 @@
+# Compiled Binaries & Executables
+server
+client
+*.out
+*.exe
+
+# Object files & Libraries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+
+# Debug symbols & folders
+*.dSYM/
+*.pdb
+
+# Build directories
+build/
+bin/
+dist/
+
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
