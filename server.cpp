@@ -14,7 +14,7 @@
 #include <netinet/ip.h>
 // C++
 #include <vector>
-
+#include <map>
 
 enum{
     RES_OK = 0,
@@ -29,7 +29,7 @@ struct Response{
 
 };
 
-
+std::map<std::string,std::string> g_data;
 
 struct Conn{
 
@@ -267,6 +267,50 @@ static int32_t parse_req(const uint8_t* data , size_t size , std::vector<std::st
     }
 
     return 0;
+}
+
+static void do_request(std::vector<std::string> &cmd , Response & out){
+
+    if(cmd.size() == 2 && cmd[0] == "get"){
+
+        auto it = g_data.find(cmd[1]);
+
+        if(it == g_data.end()){
+
+            out.status = RES_NX;
+            return;
+        }
+
+        const std::string &val = it->second;
+        out.data.assign(val.begin(),val.end());
+
+
+    }else if(cmd.size() == 3 && cmd[0] == "set"){
+
+        g_data[cmd[1]] = cmd[2];
+
+    }else if(cmd.size() == 2 && cmd[0] == "del"){
+
+        g_data.erase(cmd[1]);
+
+    }
+    else{
+
+         out.status = RES_ERR;
+
+    }
+}
+
+static void make_response(Response & Res , std::vector<uint8_t>& out){
+
+    uint32_t resp_len = 4 + (uint32_t)Res.data.size();
+
+    buf_append(out, (const uint8_t*)&resp_len, 4);
+    buf_append(out, (const uint8_t*)&Res.status, 4);
+
+    if (!Res.data.empty()) {
+        buf_append(out, Res.data.data(),  Res.data.size());
+    }
 }
 
 int main(){
