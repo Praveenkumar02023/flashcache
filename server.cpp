@@ -58,7 +58,8 @@ static void msg_errno(const char *msg) {
     fprintf(stderr, "[errno:%d] %s\n", errno, msg);
 }
 
-const size_t k_max_msg = 32 << 20;
+const size_t k_max_msg = 32 << 20;  // 32 MB
+const size_t k_max_args = 200 * 1000;
 
 static void fd_set_nb(int fd) {
     errno = 0;
@@ -194,7 +195,7 @@ static int32_t parse_req(const uint8_t* data , size_t size , std::vector<std::st
 
     }
     
-    if(nstr > k_max_msg) return -1;
+    if(nstr > k_max_args) return -1;
 
     while(out.size() < nstr){
 
@@ -239,7 +240,7 @@ static bool try_one_request(Conn *conn) {
         return false;   
     }
     
-    const uint8_t *request = &conn->incoming[4];
+    const uint8_t *request = conn->incoming.data() + 4;
     
     //got one request 
     std::vector<std::string> cmd;
@@ -248,7 +249,7 @@ static bool try_one_request(Conn *conn) {
 
         msg("bad request");
         conn->want_close = true;
-        return -1;
+        return false;
 
     }
 
@@ -339,8 +340,8 @@ int main(){
     // bind
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = ntohs(1234);
-addr.sin_addr.s_addr = htonl(INADDR_ANY);    // wildcard address 0.0.0.0
+    addr.sin_port = htons(1234);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);    // wildcard address 0.0.0.0
     int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
     if (rv) {
         die("bind()");
