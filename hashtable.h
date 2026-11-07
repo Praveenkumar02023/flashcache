@@ -1,9 +1,11 @@
+#pragma once
+
 #include <cstdint>
 #include <stddef.h>    
 
 struct HNode{
 
-    HNode * next;
+    HNode * next = NULL;
     uint64_t hcode = 0;
 
 };
@@ -16,4 +18,22 @@ struct HTab{
 
 };
 
+struct HMap{
 
+    HTab newer;
+    HTab older;
+    size_t migration_pos = 0;
+
+};
+
+HNode *hm_lookup(HMap *hmap, HNode *key,
+                 bool (*eq)(HNode *, HNode *));
+
+void hm_insert(HMap *hmap, HNode *node);
+
+HNode *hm_delete(HMap *hmap, HNode *key,
+                 bool (*eq)(HNode *, HNode *));
+
+void hm_clear(HMap *hmap);
+
+size_t hm_size(HMap *hmap);

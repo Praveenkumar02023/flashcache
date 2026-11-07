@@ -59,3 +59,115 @@ static HNode * h_detach(HTab* htab , HNode** from){
     return node;
 }
 
+
+static void hm_trigger_rehashing(HMap *hmap){
+
+    assert(hmap->older.tab == NULL);
+
+    hmap->older = hmap->newer;
+
+    //initialize new *2 size hashtable
+    h_init(&hmap->newer, (hmap->newer.mask + 1) * 2);
+
+    hmap->migration_pos =0 ;
+}
+
+
+const size_t k_rehashing_limit = 128;
+
+static void hm_help_rehashing(HMap * hmap){
+
+    size_t cur_limit = 0;
+
+    while(cur_limit < k_rehashing_limit && hmap->older.size > 0){
+
+        HNode ** from = &hmap->older.tab[hmap->migration_pos];
+
+        if(!*from){ //if no entry in current bucket move forward
+
+            hmap->migration_pos++;
+            continue;
+        }
+
+        h_insert(&hmap->newer, h_detach(&hmap->older, from));
+        cur_limit++;
+    }
+
+
+    //if migration is complete free up space occupied by older hashtable
+    if(hmap->older.size == 0 && hmap->older.tab){
+
+        free(hmap->older.tab);
+        hmap->older = HTab{};
+
+    }
+}
+
+const size_t k_max_load_factor = 8;
+
+void hm_insert(HMap *hmap, HNode *node) {
+
+    if (!hmap->newer.tab) {
+        h_init(&hmap->newer, 4);
+    }
+
+    // Always insert into newer
+    h_insert(&hmap->newer, node);
+
+    // Check whether resizing is required
+    if (!hmap->older.tab) {
+
+        size_t threshold =
+            (hmap->newer.mask + 1) * k_max_load_factor;
+
+        if (hmap->newer.size >= threshold) {
+            hm_trigger_rehashing(hmap);
+        }
+    }
+
+    // Perform some migration work
+    hm_help_rehashing(hmap);
+}
+
+HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    
+    hm_help_rehashing(hmap);
+
+    HNode **from = h_lookup(&hmap->newer, key, eq);
+
+    if (!from) {
+        from = h_lookup(&hmap->older, key, eq);
+    }
+
+    return from ? *from : NULL;
+}
+
+
+HNode *hm_delete(
+    HMap *hmap,
+    HNode *key,
+    bool (*eq)(HNode *, HNode *)
+) {
+    hm_help_rehashing(hmap);
+
+    if (HNode **from = h_lookup(&hmap->newer, key, eq)) {
+        return h_detach(&hmap->newer, from);
+    }
+
+    if (HNode **from = h_lookup(&hmap->older, key, eq)) {
+        return h_detach(&hmap->older, from);
+    }
+
+    return NULL;
+}
+
+void hm_clear(HMap *hmap) {
+    free(hmap->newer.tab);
+    free(hmap->older.tab);
+
+    *hmap = HMap{};
+}
+
+size_t hm_size(HMap *hmap) {
+    return hmap->newer.size + hmap->older.size;
+}
