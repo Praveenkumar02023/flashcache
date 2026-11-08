@@ -1,6 +1,5 @@
 
 #include <assert.h>
-#include <cstddef>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,20 +8,20 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <netinet/ip.h>
+
+#include <iostream>
+#include <sstream>
 #include <vector>
 #include <string>
 
-static void msg(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
-}
+const size_t k_max_msg = 32 << 20;
 
 static void die(const char *msg) {
-    int err = errno;
-    fprintf(stderr, "[%d] %s\n", err, msg);
-    abort();
+    fprintf(stderr, "[%d] %s\n", errno, msg);
+    exit(EXIT_FAILURE);
 }
 
+// Read exactly n bytes.
 static int32_t read_full(int fd, uint8_t *buf, size_t n) {
     while (n > 0) {
         ssize_t rv = read(fd, buf, n);
@@ -35,7 +34,6 @@ static int32_t read_full(int fd, uint8_t *buf, size_t n) {
             return -1;
         }
 
-        assert((size_t)rv <= n);
         n -= (size_t)rv;
         buf += rv;
     }
@@ -43,6 +41,7 @@ static int32_t read_full(int fd, uint8_t *buf, size_t n) {
     return 0;
 }
 
+// Write exactly n bytes.
 static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
     while (n > 0) {
         ssize_t rv = write(fd, buf, n);
@@ -55,7 +54,6 @@ static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
             return -1;
         }
 
-        assert((size_t)rv <= n);
         n -= (size_t)rv;
         buf += rv;
     }
@@ -63,147 +61,180 @@ static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
     return 0;
 }
 
-const size_t k_max_msg = 32 << 20;
+// Encode and send a request.
+static int32_t send_req(
+    int fd,
+    const std::vector<std::string> &cmd
+) {
+    if (cmd.empty()) {
+        return -1;
+    }
 
-static void buff_append(std::vector<uint8_t>& buff, const uint8_t *data, size_t len) {
-    buff.insert(buff.end(), data, data + len);
-}
-
-// NEW: Encode and send a structured request
-static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
-
-    uint32_t len = 4;
+    uint64_t len = 4;
 
     for (const std::string &s : cmd) {
         len += 4 + s.size();
     }
 
-    if (len > k_max_msg) {
-        msg("message too long");
+    if (len > k_max_msg || len > UINT32_MAX) {
+        fprintf(stderr, "Message too long\n");
         return -1;
     }
 
-    std::vector<uint8_t> wbuf(4 + len);
+    uint32_t msg_len = (uint32_t)len;
+    std::vector<uint8_t> wbuf(4 + msg_len);
 
-    // 4-byte message length
-    memcpy(wbuf.data(), &len, 4);
+    // Message length.
+    memcpy(wbuf.data(), &msg_len, 4);
 
-    // Number of strings
+    // Number of arguments.
     uint32_t n = (uint32_t)cmd.size();
     memcpy(wbuf.data() + 4, &n, 4);
 
     size_t cur = 8;
 
-    // Encode each string
+    // Encode every argument.
     for (const std::string &s : cmd) {
+        uint32_t str_len = (uint32_t)s.size();
 
-        uint32_t p = (uint32_t)s.size();
+        memcpy(wbuf.data() + cur, &str_len, 4);
+        cur += 4;
 
-        memcpy(wbuf.data() + cur, &p, 4);
-        memcpy(wbuf.data() + cur + 4, s.data(), s.size());
-
-        cur += 4 + s.size();
+        memcpy(wbuf.data() + cur, s.data(), s.size());
+        cur += s.size();
     }
 
     return write_all(fd, wbuf.data(), wbuf.size());
 }
 
-// UPDATED: Read response length, status and data
+// Receive and decode a response.
 static int32_t read_res(int fd) {
-
-    std::vector<uint8_t> rbuf;
-
-    rbuf.resize(4);
-
-    errno = 0;
-
-    int32_t err = read_full(fd, rbuf.data(), 4);
-
-    if (err) {
-
-        if (errno == 0) {
-            msg("EOF");
-        } else {
-            msg("read() error");
-        }
-
-        return err;
-    }
-
     uint32_t len = 0;
 
-    memcpy(&len, rbuf.data(), 4);
-
-    if (len > k_max_msg || len < 4) {
-        msg("bad response length");
+    if (read_full(fd, (uint8_t *)&len, 4) < 0) {
+        fprintf(stderr, "Failed to read response length\n");
         return -1;
     }
 
-    // Read response body
-    rbuf.resize(4 + len);
-
-    err = read_full(fd, rbuf.data() + 4, len);
-
-    if (err) {
-        msg("read() error");
-        return err;
+    if (len < 4 || len > k_max_msg) {
+        fprintf(stderr, "Invalid response length\n");
+        return -1;
     }
 
-    // Extract response status
-    uint32_t rescode = 0;
+    std::vector<uint8_t> rbuf(len);
 
-    memcpy(&rescode, rbuf.data() + 4, 4);
+    if (read_full(fd, rbuf.data(), len) < 0) {
+        fprintf(stderr, "Failed to read response body\n");
+        return -1;
+    }
 
-    // Print response
-    printf(
-        "server says: [%u] %.*s\n",
-        rescode,
-        (int)(len - 4),
-        (const char *)(rbuf.data() + 8)
+    uint32_t status = 0;
+    memcpy(&status, rbuf.data(), 4);
+
+    std::string data(
+        (const char *)rbuf.data() + 4,
+        len - 4
     );
+
+    switch (status) {
+        case 0:
+            if (!data.empty()) {
+                std::cout << data << "\n";
+            } else {
+                std::cout << "OK\n";
+            }
+            break;
+
+        case 1:
+            std::cout << "Error: Invalid command\n";
+            break;
+
+        case 2:
+            std::cout << "Key not found\n";
+            break;
+
+        default:
+            std::cout << "Unknown response status: "
+                      << status << "\n";
+            break;
+    }
 
     return 0;
 }
 
-int main(int argc, char **argv) {
+// Convert user input into command arguments.
+static std::vector<std::string> parse_command(
+    const std::string &line
+) {
+    std::istringstream iss(line);
 
+    std::vector<std::string> cmd;
+    std::string arg;
+
+    while (iss >> arg) {
+        cmd.push_back(arg);
+    }
+
+    return cmd;
+}
+
+int main() {
+    // Create TCP socket.
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (fd < 0) {
         die("socket()");
     }
 
+    // Server address.
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(1234);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
-
-    if (rv) {
-        die("connect");
+    // Connect to server.
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        die("connect()");
     }
 
-    // Build command from command-line arguments
-    std::vector<std::string> cmd;
+    std::cout << "Connected to FlashCache!\n";
+    std::cout << "Commands: set, get, del\n";
+    std::cout << "Type exit to quit.\n\n";
 
-    for (int i = 1; i < argc; ++i) {
-        cmd.push_back(argv[i]);
+    std::string line;
+
+    while (true) {
+        std::cout << "> ";
+
+        if (!std::getline(std::cin, line)) {
+            break;
+        }
+
+        std::vector<std::string> cmd = parse_command(line);
+
+        if (cmd.empty()) {
+            continue;
+        }
+
+        if (cmd[0] == "exit") {
+            break;
+        }
+
+        // Send request.
+        if (send_req(fd, cmd) < 0) {
+            fprintf(stderr, "Failed to send request\n");
+            break;
+        }
+
+        // Receive response.
+        if (read_res(fd) < 0) {
+            break;
+        }
     }
 
-    int32_t err = send_req(fd, cmd);
-
-    if (err) {
-        goto L_DONE;
-    }
-
-    err = read_res(fd);
-
-    if (err) {
-        goto L_DONE;
-    }
-
-L_DONE:
     close(fd);
+
+    std::cout << "Disconnected.\n";
+
     return 0;
 }
