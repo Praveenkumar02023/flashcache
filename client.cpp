@@ -1,4 +1,3 @@
-
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -15,6 +14,16 @@
 #include <string>
 
 const size_t k_max_msg = 32 << 20;
+
+// TLV tags - must match server.cpp
+enum {
+    TAG_NIL = 0,
+    TAG_ERR = 1,
+    TAG_STR = 2,
+    TAG_INT = 3,
+    TAG_DBL = 4,
+    TAG_ARR = 5,
+};
 
 static void die(const char *msg) {
     fprintf(stderr, "[%d] %s\n", errno, msg);
@@ -107,6 +116,166 @@ static int32_t send_req(
     return write_all(fd, wbuf.data(), wbuf.size());
 }
 
+// Read a uint32 value.
+static bool read_u32(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    uint32_t &out
+) {
+    if ((size_t)(end - cur) < 4) {
+        return false;
+    }
+
+    memcpy(&out, cur, 4);
+    cur += 4;
+
+    return true;
+}
+
+// Read an int64 value.
+static bool read_i64(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    int64_t &out
+) {
+    if ((size_t)(end - cur) < 8) {
+        return false;
+    }
+
+    memcpy(&out, cur, 8);
+    cur += 8;
+
+    return true;
+}
+
+// Read a double value.
+static bool read_dbl(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    double &out
+) {
+    if ((size_t)(end - cur) < 8) {
+        return false;
+    }
+
+    memcpy(&out, cur, 8);
+    cur += 8;
+
+    return true;
+}
+
+// Decode and print one serialized value.
+static bool print_response(
+    const uint8_t *&cur,
+    const uint8_t *end
+) {
+    if (cur >= end) {
+        return false;
+    }
+
+    // First byte tells us the data type.
+    uint8_t tag = *cur++;
+
+    switch (tag) {
+
+        case TAG_NIL: {
+            std::cout << "OK\n";
+            return true;
+        }
+
+        case TAG_ERR: {
+            uint32_t code = 0;
+            uint32_t len = 0;
+
+            if (!read_u32(cur, end, code) ||
+                !read_u32(cur, end, len)) {
+                return false;
+            }
+
+            if ((size_t)(end - cur) < len) {
+                return false;
+            }
+
+            std::string msg((const char *)cur, len);
+            cur += len;
+
+            std::cout << "Error [" << code << "]: "
+                      << msg << "\n";
+
+            return true;
+        }
+
+        case TAG_STR: {
+            uint32_t len = 0;
+
+            if (!read_u32(cur, end, len)) {
+                return false;
+            }
+
+            if ((size_t)(end - cur) < len) {
+                return false;
+            }
+
+            std::string val((const char *)cur, len);
+            cur += len;
+
+            std::cout << val << "\n";
+
+            return true;
+        }
+
+        case TAG_INT: {
+            int64_t val = 0;
+
+            if (!read_i64(cur, end, val)) {
+                return false;
+            }
+
+            std::cout << val << "\n";
+
+            return true;
+        }
+
+        case TAG_DBL: {
+            double val = 0;
+
+            if (!read_dbl(cur, end, val)) {
+                return false;
+            }
+
+            std::cout << val << "\n";
+
+            return true;
+        }
+
+        case TAG_ARR: {
+            uint32_t n = 0;
+
+            if (!read_u32(cur, end, n)) {
+                return false;
+            }
+
+            std::cout << "[\n";
+
+            for (uint32_t i = 0; i < n; i++) {
+                std::cout << "  ";
+
+                if (!print_response(cur, end)) {
+                    return false;
+                }
+            }
+
+            std::cout << "]\n";
+
+            return true;
+        }
+
+        default:
+            fprintf(stderr, "Unknown TLV tag: %u\n", tag);
+            return false;
+    }
+}
+
 // Receive and decode a response.
 static int32_t read_res(int fd) {
     uint32_t len = 0;
@@ -116,8 +285,9 @@ static int32_t read_res(int fd) {
         return -1;
     }
 
-    if (len < 4 || len > k_max_msg) {
-        fprintf(stderr, "Invalid response length\n");
+    // TLV body can be as small as one byte (TAG_NIL).
+    if (len == 0 || len > k_max_msg) {
+        fprintf(stderr, "Invalid response length: %u\n", len);
         return -1;
     }
 
@@ -128,35 +298,12 @@ static int32_t read_res(int fd) {
         return -1;
     }
 
-    uint32_t status = 0;
-    memcpy(&status, rbuf.data(), 4);
+    const uint8_t *cur = rbuf.data();
+    const uint8_t *end = cur + rbuf.size();
 
-    std::string data(
-        (const char *)rbuf.data() + 4,
-        len - 4
-    );
-
-    switch (status) {
-        case 0:
-            if (!data.empty()) {
-                std::cout << data << "\n";
-            } else {
-                std::cout << "OK\n";
-            }
-            break;
-
-        case 1:
-            std::cout << "Error: Invalid command\n";
-            break;
-
-        case 2:
-            std::cout << "Key not found\n";
-            break;
-
-        default:
-            std::cout << "Unknown response status: "
-                      << status << "\n";
-            break;
+    if (!print_response(cur, end) || cur != end) {
+        fprintf(stderr, "Malformed response\n");
+        return -1;
     }
 
     return 0;
