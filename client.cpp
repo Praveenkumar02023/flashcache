@@ -1,21 +1,23 @@
-#include <assert.h>
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include <errno.h>
-#include <unistd.h>
+
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <iostream>
 #include <sstream>
-#include <vector>
 #include <string>
+#include <vector>
 
-const size_t k_max_msg = 32 << 20;
+static const size_t k_max_msg = 32 << 20;
 
-// TLV tags - must match server.cpp
+typedef std::vector<uint8_t> Buffer;
+
+// TLV response tags. These must match server.cpp.
 enum {
     TAG_NIL = 0,
     TAG_ERR = 1,
@@ -25,335 +27,406 @@ enum {
     TAG_ARR = 5,
 };
 
-static void die(const char *msg) {
-    fprintf(stderr, "[%d] %s\n", errno, msg);
-    exit(EXIT_FAILURE);
-}
+// --------------------------------------------------
+// Socket helpers
+// --------------------------------------------------
 
-// Read exactly n bytes.
-static int32_t read_full(int fd, uint8_t *buf, size_t n) {
+static bool read_full(int fd, uint8_t *buf, size_t n) {
     while (n > 0) {
         ssize_t rv = read(fd, buf, n);
 
-        if (rv < 0 && errno == EINTR) {
-            continue;
+        if (rv == 0) {
+            return false;
         }
 
-        if (rv <= 0) {
-            return -1;
+        if (rv < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
         }
 
-        n -= (size_t)rv;
         buf += rv;
+        n -= (size_t)rv;
     }
 
-    return 0;
+    return true;
 }
 
-// Write exactly n bytes.
-static int32_t write_all(int fd, const uint8_t *buf, size_t n) {
+static bool write_all(int fd, const uint8_t *buf, size_t n) {
     while (n > 0) {
         ssize_t rv = write(fd, buf, n);
 
-        if (rv < 0 && errno == EINTR) {
-            continue;
+        if (rv < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
         }
 
-        if (rv <= 0) {
-            return -1;
+        if (rv == 0) {
+            return false;
         }
 
-        n -= (size_t)rv;
         buf += rv;
+        n -= (size_t)rv;
     }
-
-    return 0;
-}
-
-// Encode and send a request.
-static int32_t send_req(
-    int fd,
-    const std::vector<std::string> &cmd
-) {
-    if (cmd.empty()) {
-        return -1;
-    }
-
-    uint64_t len = 4;
-
-    for (const std::string &s : cmd) {
-        len += 4 + s.size();
-    }
-
-    if (len > k_max_msg || len > UINT32_MAX) {
-        fprintf(stderr, "Message too long\n");
-        return -1;
-    }
-
-    uint32_t msg_len = (uint32_t)len;
-    std::vector<uint8_t> wbuf(4 + msg_len);
-
-    // Message length.
-    memcpy(wbuf.data(), &msg_len, 4);
-
-    // Number of arguments.
-    uint32_t n = (uint32_t)cmd.size();
-    memcpy(wbuf.data() + 4, &n, 4);
-
-    size_t cur = 8;
-
-    // Encode every argument.
-    for (const std::string &s : cmd) {
-        uint32_t str_len = (uint32_t)s.size();
-
-        memcpy(wbuf.data() + cur, &str_len, 4);
-        cur += 4;
-
-        memcpy(wbuf.data() + cur, s.data(), s.size());
-        cur += s.size();
-    }
-
-    return write_all(fd, wbuf.data(), wbuf.size());
-}
-
-// Read a uint32 value.
-static bool read_u32(
-    const uint8_t *&cur,
-    const uint8_t *end,
-    uint32_t &out
-) {
-    if ((size_t)(end - cur) < 4) {
-        return false;
-    }
-
-    memcpy(&out, cur, 4);
-    cur += 4;
 
     return true;
 }
 
-// Read an int64 value.
-static bool read_i64(
-    const uint8_t *&cur,
-    const uint8_t *end,
-    int64_t &out
-) {
-    if ((size_t)(end - cur) < 8) {
+// --------------------------------------------------
+// Request serialization
+// --------------------------------------------------
+
+static void buf_append(Buffer &buf, const uint8_t *data, size_t n) {
+    buf.insert(buf.end(), data, data + n);
+}
+
+static void buf_append_u32(Buffer &buf, uint32_t value) {
+    buf_append(buf, (const uint8_t *)&value, sizeof(value));
+}
+
+static bool send_req(int fd, const std::vector<std::string> &cmd) {
+    Buffer payload;
+
+    // Number of command arguments.
+    buf_append_u32(payload, (uint32_t)cmd.size());
+
+    // Serialize every argument as:
+    // uint32 length + string bytes.
+    for (const std::string &arg : cmd) {
+        if (arg.size() > UINT32_MAX) {
+            std::cerr << "Argument too large\n";
+            return false;
+        }
+
+        buf_append_u32(payload, (uint32_t)arg.size());
+
+        buf_append(
+            payload,
+            (const uint8_t *)arg.data(),
+            arg.size()
+        );
+    }
+
+    if (payload.size() > k_max_msg) {
+        std::cerr << "Request too large\n";
         return false;
     }
 
-    memcpy(&out, cur, 8);
-    cur += 8;
+    // TCP message framing:
+    // uint32 payload length + payload.
+    Buffer message;
 
-    return true;
+    buf_append_u32(message, (uint32_t)payload.size());
+    buf_append(message, payload.data(), payload.size());
+
+    return write_all(fd, message.data(), message.size());
 }
 
-// Read a double value.
-static bool read_dbl(
+// --------------------------------------------------
+// TLV deserialization helpers
+// --------------------------------------------------
+
+static bool read_u8(
     const uint8_t *&cur,
     const uint8_t *end,
-    double &out
-) {
-    if ((size_t)(end - cur) < 8) {
-        return false;
-    }
-
-    memcpy(&out, cur, 8);
-    cur += 8;
-
-    return true;
-}
-
-// Decode and print one serialized value.
-static bool print_response(
-    const uint8_t *&cur,
-    const uint8_t *end
+    uint8_t &value
 ) {
     if (cur >= end) {
         return false;
     }
 
-    // First byte tells us the data type.
-    uint8_t tag = *cur++;
+    value = *cur;
+    cur++;
+
+    return true;
+}
+
+static bool read_u32(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    uint32_t &value
+) {
+    if ((size_t)(end - cur) < sizeof(value)) {
+        return false;
+    }
+
+    memcpy(&value, cur, sizeof(value));
+    cur += sizeof(value);
+
+    return true;
+}
+
+static bool read_i64(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    int64_t &value
+) {
+    if ((size_t)(end - cur) < sizeof(value)) {
+        return false;
+    }
+
+    memcpy(&value, cur, sizeof(value));
+    cur += sizeof(value);
+
+    return true;
+}
+
+static bool read_dbl(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    double &value
+) {
+    if ((size_t)(end - cur) < sizeof(value)) {
+        return false;
+    }
+
+    memcpy(&value, cur, sizeof(value));
+    cur += sizeof(value);
+
+    return true;
+}
+
+static bool read_string(
+    const uint8_t *&cur,
+    const uint8_t *end,
+    uint32_t len,
+    std::string &value
+) {
+    if ((size_t)(end - cur) < len) {
+        return false;
+    }
+
+    value.assign((const char *)cur, len);
+    cur += len;
+
+    return true;
+}
+
+// --------------------------------------------------
+// Recursive TLV response decoder
+// --------------------------------------------------
+
+static bool print_response(
+    const uint8_t *&cur,
+    const uint8_t *end
+) {
+    uint8_t tag = 0;
+
+    if (!read_u8(cur, end, tag)) {
+        return false;
+    }
 
     switch (tag) {
 
-        case TAG_NIL: {
-            std::cout << "OK\n";
-            return true;
-        }
+    case TAG_NIL: {
+        std::cout << "OK";
+        return true;
+    }
 
-        case TAG_ERR: {
-            uint32_t code = 0;
-            uint32_t len = 0;
+    case TAG_ERR: {
+        uint32_t code = 0;
+        uint32_t len = 0;
+        std::string message;
 
-            if (!read_u32(cur, end, code) ||
-                !read_u32(cur, end, len)) {
-                return false;
-            }
-
-            if ((size_t)(end - cur) < len) {
-                return false;
-            }
-
-            std::string msg((const char *)cur, len);
-            cur += len;
-
-            std::cout << "Error [" << code << "]: "
-                      << msg << "\n";
-
-            return true;
-        }
-
-        case TAG_STR: {
-            uint32_t len = 0;
-
-            if (!read_u32(cur, end, len)) {
-                return false;
-            }
-
-            if ((size_t)(end - cur) < len) {
-                return false;
-            }
-
-            std::string val((const char *)cur, len);
-            cur += len;
-
-            std::cout << val << "\n";
-
-            return true;
-        }
-
-        case TAG_INT: {
-            int64_t val = 0;
-
-            if (!read_i64(cur, end, val)) {
-                return false;
-            }
-
-            std::cout << val << "\n";
-
-            return true;
-        }
-
-        case TAG_DBL: {
-            double val = 0;
-
-            if (!read_dbl(cur, end, val)) {
-                return false;
-            }
-
-            std::cout << val << "\n";
-
-            return true;
-        }
-
-        case TAG_ARR: {
-            uint32_t n = 0;
-
-            if (!read_u32(cur, end, n)) {
-                return false;
-            }
-
-            std::cout << "[\n";
-
-            for (uint32_t i = 0; i < n; i++) {
-                std::cout << "  ";
-
-                if (!print_response(cur, end)) {
-                    return false;
-                }
-            }
-
-            std::cout << "]\n";
-
-            return true;
-        }
-
-        default:
-            fprintf(stderr, "Unknown TLV tag: %u\n", tag);
+        if (!read_u32(cur, end, code)) {
             return false;
+        }
+
+        if (!read_u32(cur, end, len)) {
+            return false;
+        }
+
+        if (!read_string(cur, end, len, message)) {
+            return false;
+        }
+
+        std::cout << "Error [" << code << "]: " << message;
+        return true;
+    }
+
+    case TAG_STR: {
+        uint32_t len = 0;
+
+        if (!read_u32(cur, end, len)) {
+            return false;
+        }
+
+        if ((size_t)(end - cur) < len) {
+            return false;
+        }
+
+        std::cout.write((const char *)cur, len);
+        cur += len;
+
+        return true;
+    }
+
+    case TAG_INT: {
+        int64_t value = 0;
+
+        if (!read_i64(cur, end, value)) {
+            return false;
+        }
+
+        std::cout << value;
+        return true;
+    }
+
+    case TAG_DBL: {
+        double value = 0;
+
+        if (!read_dbl(cur, end, value)) {
+            return false;
+        }
+
+        std::cout << value;
+        return true;
+    }
+
+    case TAG_ARR: {
+        uint32_t count = 0;
+
+        if (!read_u32(cur, end, count)) {
+            return false;
+        }
+
+        // Basic sanity check: each element needs at least one tag byte.
+        if ((size_t)(end - cur) < count) {
+            return false;
+        }
+
+        std::cout << "[\n";
+
+        for (uint32_t i = 0; i < count; i++) {
+            std::cout << "  ";
+
+            // IMPORTANT:
+            // cur is passed by reference, so every nested value
+            // advances the same cursor.
+            if (!print_response(cur, end)) {
+                return false;
+            }
+
+            std::cout << "\n";
+        }
+
+        std::cout << "]";
+        return true;
+    }
+
+    default:
+        std::cerr << "Unknown response tag: "
+                  << (int)tag << "\n";
+        return false;
     }
 }
 
-// Receive and decode a response.
-static int32_t read_res(int fd) {
+// --------------------------------------------------
+// Response framing and decoding
+// --------------------------------------------------
+
+static bool read_res(int fd) {
     uint32_t len = 0;
 
-    if (read_full(fd, (uint8_t *)&len, 4) < 0) {
-        fprintf(stderr, "Failed to read response length\n");
-        return -1;
+    // Read the 4-byte response length.
+    if (!read_full(fd, (uint8_t *)&len, sizeof(len))) {
+        return false;
     }
 
-    // TLV body can be as small as one byte (TAG_NIL).
     if (len == 0 || len > k_max_msg) {
-        fprintf(stderr, "Invalid response length: %u\n", len);
-        return -1;
+        std::cerr << "Invalid response length: " << len << "\n";
+        return false;
     }
 
-    std::vector<uint8_t> rbuf(len);
+    // Read the complete response body.
+    Buffer body(len);
 
-    if (read_full(fd, rbuf.data(), len) < 0) {
-        fprintf(stderr, "Failed to read response body\n");
-        return -1;
+    if (!read_full(fd, body.data(), body.size())) {
+        return false;
     }
 
-    const uint8_t *cur = rbuf.data();
-    const uint8_t *end = cur + rbuf.size();
+    const uint8_t *cur = body.data();
+    const uint8_t *end = cur + body.size();
 
-    if (!print_response(cur, end) || cur != end) {
-        fprintf(stderr, "Malformed response\n");
-        return -1;
+    if (!print_response(cur, end)) {
+        std::cerr << "\nMalformed response\n";
+        return false;
     }
 
-    return 0;
+    // Ensure the decoder consumed the entire response.
+    if (cur != end) {
+        std::cerr << "\nMalformed response: "
+                  << (end - cur)
+                  << " trailing bytes\n";
+        return false;
+    }
+
+    std::cout << "\n";
+    return true;
 }
 
-// Convert user input into command arguments.
-static std::vector<std::string> parse_command(
-    const std::string &line
-) {
-    std::istringstream iss(line);
+// --------------------------------------------------
+// Command parsing
+// --------------------------------------------------
 
+static std::vector<std::string> parse_command(const std::string &line) {
     std::vector<std::string> cmd;
-    std::string arg;
 
-    while (iss >> arg) {
-        cmd.push_back(arg);
+    std::stringstream ss(line);
+    std::string word;
+
+    while (ss >> word) {
+        cmd.push_back(word);
     }
 
     return cmd;
 }
 
+// --------------------------------------------------
+// Main
+// --------------------------------------------------
+
 int main() {
-    // Create TCP socket.
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (fd < 0) {
-        die("socket()");
+        perror("socket");
+        return 1;
     }
 
-    // Server address.
-    struct sockaddr_in addr = {};
+    sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(1234);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    // Connect to server.
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        die("connect()");
+    if (inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+        std::cerr << "Invalid server address\n";
+        close(fd);
+        return 1;
+    }
+
+    if (connect(fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        close(fd);
+        return 1;
     }
 
     std::cout << "Connected to FlashCache!\n";
-    std::cout << "Commands: set, get, del\n";
+    std::cout << "Commands: set, get, del, keys\n";
     std::cout << "Type exit to quit.\n\n";
 
     std::string line;
 
     while (true) {
-        std::cout << "> ";
+        std::cout << "> " << std::flush;
 
         if (!std::getline(std::cin, line)) {
+            break;
+        }
+
+        if (line == "exit") {
             break;
         }
 
@@ -363,25 +436,17 @@ int main() {
             continue;
         }
 
-        if (cmd[0] == "exit") {
+        if (!send_req(fd, cmd)) {
+            std::cerr << "Failed to send request\n";
             break;
         }
 
-        // Send request.
-        if (send_req(fd, cmd) < 0) {
-            fprintf(stderr, "Failed to send request\n");
-            break;
-        }
-
-        // Receive response.
-        if (read_res(fd) < 0) {
+        if (!read_res(fd)) {
+            std::cerr << "Disconnected.\n";
             break;
         }
     }
 
     close(fd);
-
-    std::cout << "Disconnected.\n";
-
     return 0;
 }

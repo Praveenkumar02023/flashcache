@@ -328,21 +328,44 @@ static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     out_int(out, node ? 1 : 0);
 }
 
+static bool cb_keys(HNode *node, void *arg) {
+    Buffer &out = *(Buffer *)arg;
+
+    Entry *ent = container_of(node, Entry, node);
+
+    out_str(out, ent->key.data(), ent->key.size());
+
+    return true;
+}
+
+static void do_keys(std::vector<std::string> &, Buffer &out) {
+    out_arr(out, (uint32_t)hm_size(&g_data.db));
+
+    hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+}
+
+
 // Command dispatcher
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
     }
 
-    if (cmd.size() == 3 && cmd[0] == "set") {
+    else if (cmd.size() == 3 && cmd[0] == "set") {
         return do_set(cmd, out);
     }
 
-    if (cmd.size() == 2 && cmd[0] == "del") {
+    else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
     }
+    else if (cmd.size() == 1 && cmd[0] == "keys") {
+        do_keys(cmd, out);
+    }
+    else{
 
-    return out_err(out, ERR_UNKNOWN, "unknown command");
+        out_err(out, ERR_UNKNOWN, "unknown command");
+
+    }
 }
 
 

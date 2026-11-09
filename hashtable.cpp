@@ -171,3 +171,39 @@ void hm_clear(HMap *hmap) {
 size_t hm_size(HMap *hmap) {
     return hmap->newer.size + hmap->older.size;
 }
+
+static bool h_foreach(
+    HTab *htab,
+    bool (*f)(HNode *, void *),
+    void *arg
+) {
+    if (htab->tab == NULL) {
+        return true;
+    }
+
+    for (size_t i = 0; i <= htab->mask; i++) {
+        HNode *node = htab->tab[i];
+
+        while (node != NULL) {
+            if (!f(node, arg)) {
+                return false;
+            }
+
+            node = node->next;
+        }
+    }
+
+    return true;
+}
+
+void hm_foreach(
+    HMap *hmap,
+    bool (*f)(HNode *, void *),
+    void *arg
+) {
+    if (!h_foreach(&hmap->newer, f, arg)) {
+        return;
+    }
+
+    h_foreach(&hmap->older, f, arg);
+}

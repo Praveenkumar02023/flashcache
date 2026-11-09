@@ -37,3 +37,5 @@ HNode *hm_delete(HMap *hmap, HNode *key,
 void hm_clear(HMap *hmap);
 
 size_t hm_size(HMap *hmap);
+
+void hm_foreach(HMap *hmap , bool (*f)(HNode* , void *), void* arg);
