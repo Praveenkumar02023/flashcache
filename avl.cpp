@@ -132,3 +132,72 @@ AVLNode *avl_fix(AVLNode *node) {
     return NULL;
 }
 
+static AVLNode *avl_del_easy(AVLNode *node) {
+    assert(!node->left || !node->right);
+
+    AVLNode *child = node->left ? node->left : node->right;
+    AVLNode *parent = node->parent;
+
+    // Update child's parent pointer.
+    if (child) {
+        child->parent = parent;
+    }
+
+    // Special case: deleting the root.
+    if (!parent) {
+        return child;
+    }
+
+    // Connect the child to the parent.
+    AVLNode **from = parent->left == node
+        ? &parent->left
+        : &parent->right;
+
+    *from = child;
+
+    // Restore AVL balance.
+    return avl_fix(parent);
+}
+
+AVLNode *avl_del(AVLNode *node) {
+    // Easy case: zero or one child.
+    if (!node->left || !node->right) {
+        return avl_del_easy(node);
+    }
+
+    // Find the in-order successor.
+    AVLNode *victim = node->right;
+
+    while (victim->left) {
+        victim = victim->left;
+    }
+
+    // Detach the successor from its original position.
+    AVLNode *root = avl_del_easy(victim);
+
+    // Move the successor into the deleted node's position.
+    *victim = *node;
+
+    // Repair parent pointers of the children.
+    if (victim->left) {
+        victim->left->parent = victim;
+    }
+
+    if (victim->right) {
+        victim->right->parent = victim;
+    }
+
+    // Reconnect the successor to the tree.
+    AVLNode **from = &root;
+    AVLNode *parent = node->parent;
+
+    if (parent) {
+        from = parent->left == node
+            ? &parent->left
+            : &parent->right;
+    }
+
+    *from = victim;
+
+    return root;
+}
