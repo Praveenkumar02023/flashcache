@@ -208,8 +208,8 @@ int main() {
             return;
         }
 
-        auto result = nodes.try_emplace(key);
-        TestNode *node = &result.first->second;
+        TestNode &entry = nodes[key];
+        TestNode *node = &entry;
 
         node->key = key;
         avl_init(&node->avl);
@@ -308,4 +308,61 @@ int main() {
     std::cout << "\nAll AVL tests passed!\n";
 
     return 0;
+}
+
+static int32_t cmp(AVLNode *node, void *key) {
+    int current_key = container_of(node)->key;
+    int target_key = *static_cast<int *>(key);
+
+    if (current_key < target_key) return -1;
+    if (current_key > target_key) return 1;
+
+    return 0;
+}
+
+static void search_and_insert(
+    AVLNode **root,
+    AVLNode *new_node,
+    bool (*less)(AVLNode *, AVLNode *)
+) {
+    // Find the insertion position.
+    AVLNode *parent = NULL;
+    AVLNode **from = root;
+
+    for (AVLNode *node = *root; node; ) {
+        from = less(new_node, node)
+            ? &node->left
+            : &node->right;
+
+        parent = node;
+        node = *from;
+    }
+
+    // Link the new node.
+    *from = new_node;
+    new_node->parent = parent;
+
+    // Restore AVL balance.
+    *root = avl_fix(new_node);
+}
+
+static AVLNode *search_and_delete(
+    AVLNode **root,
+    int32_t (*cmp)(AVLNode *, void *),
+    void *key
+) {
+    for (AVLNode *node = *root; node; ) {
+        int32_t r = cmp(node, key);
+
+        if (r < 0) {
+            node = node->right;
+        } else if (r > 0) {
+            node = node->left;
+        } else {
+            *root = avl_del(node);
+            return node;
+        }
+    }
+
+    return NULL;
 }
